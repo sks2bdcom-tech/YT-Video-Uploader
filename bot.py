@@ -1,4 +1,4 @@
-import asyncio, os, re, tempfile, shutil, logging, time
+import asyncio, os, re, json, tempfile, shutil, logging, time, itertools
 import yt_dlp
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,8 +16,74 @@ USE_TELETHON = bool(API_ID and API_HASH)
 URL_RE = re.compile(r"(?:https?://|(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/)\S+", re.I)
 YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/live/|/embed/)([A-Za-z0-9_-]{11})")
 COOKIE_PATH = "/tmp/yt_cookies.txt"
+HISTORY_PATH = "/tmp/uploaded_history.json"
 lock = asyncio.Semaphore(1)  # one job at a time (queue)
 tl_client = None
+job_seq = itertools.count(1)
+jobs_by_id = {}       # job_id -> Job (active/queued/paused)
+forced_jobs = {}      # job_id -> dict(chat_id, title, label, dl, custom_title, src_key)
+uploaded_history = {} # key -> {"vid": str, "title": str}
+
+class CancelledJob(Exception):
+    pass
+
+def load_history():
+    global uploaded_history
+    if os.path.exists(HISTORY_PATH):
+        try:
+            with open(HISTORY_PATH, "r", encoding="utf-8") as fp:
+                uploaded_history = json.load(fp)
+        except Exception:
+            uploaded_history = {}
+
+def save_history():
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as fp:
+            json.dump(uploaded_history, fp)
+    except Exception:
+        pass
+
+def norm_url_key(url):
+    ym = YT_ID_RE.search(url)
+    if ym:
+        return "yt:" + ym.group(1)
+    u = url.strip().split("#")[0].rstrip("/")
+    return "url:" + u.lower()
+
+def norm_title_key(title):
+    t = clean_title(title).lower()
+    if not t or t in ("video", "telegram video") or t.startswith(("video ", "youtube ")):
+        return ""
+    return "title:" + t
+
+def find_duplicate_uploaded(src_key, title, custom_title=False):
+    if src_key and src_key in uploaded_history:
+        return uploaded_history[src_key]
+    if custom_title:
+        tk = norm_title_key(title)
+        if tk and tk in uploaded_history:
+            return uploaded_history[tk]
+    return None
+
+def find_duplicate_active(src_key, title, custom_title=False, exclude_id=None):
+    tk = norm_title_key(title) if custom_title else ""
+    for jid, j in list(jobs_by_id.items()):
+        if jid == exclude_id or j.cancelled or j.finished:
+            continue
+        if src_key and j.src_key == src_key:
+            return j
+        if tk and norm_title_key(j.title) == tk:
+            return j
+    return None
+
+def record_uploaded(src_key, title, vid):
+    entry = {"vid": vid, "title": clean_title(title)}
+    if src_key:
+        uploaded_history[src_key] = entry
+    tk = norm_title_key(title)
+    if tk:
+        uploaded_history[tk] = entry
+    save_history()
 
 def init_cookies():
     raw = os.getenv("YT_COOKIES", "").strip()
@@ -47,7 +113,9 @@ def clean_title(t):
     t = re.sub(r"\s+", " ", t).strip()
     return t[:100] or "Video"
 
-def upload(path, title, state):
+def upload(path, title, state, job):
+    if job.cancelled:
+        raise CancelledJob("Cancelled")
     ext = os.path.splitext(path)[1].lower()
     mime = {".mp4": "video/mp4", ".mkv": "video/x-matroska", ".webm": "video/webm",
             ".mov": "video/quicktime", ".ts": "video/mp2t"}.get(ext, "video/mp4")
@@ -59,7 +127,11 @@ def upload(path, title, state):
     t0 = time.time(); size = os.path.getsize(path)
     state["text"] = state["prefix"] + f"\u2b06\ufe0f Uploading to YouTube\n{bar(0)}\n0.0 MB / {fmt(size)}"
     while resp is None:
+        if job.cancelled:
+            raise CancelledJob("Cancelled")
         status, resp = req.next_chunk()
+        if job.cancelled:
+            raise CancelledJob("Cancelled")
         if status:
             pr = status.progress()
             state["text"] = (state["prefix"] + f"\u2b06\ufe0f Uploading to YouTube\n{bar(pr*100)}\n"
@@ -77,10 +149,12 @@ def dir_size(d):
 class TooBig(Exception):
     pass
 
-def download_url_sync(url, d, state):
+def download_url_sync(url, d, state, job):
     init_cookies()
     def attempt(height, limit):
         def hook(h):
+            if job.cancelled:
+                raise CancelledJob("Cancelled")
             if h["status"] == "downloading":
                 if dir_size(d) > limit:
                     state["toobig"] = True
@@ -124,6 +198,8 @@ def download_url_sync(url, d, state):
         state["toobig"] = False
         try:
             info = attempt(height, 10**13)
+            if job.cancelled:
+                raise CancelledJob("Cancelled")
             ext_title = None
             if isinstance(info, dict):
                 if "entries" in info and info["entries"]:
@@ -142,13 +218,13 @@ def download_url_sync(url, d, state):
             raise
     raise RuntimeError("Video is too large for the server disk.")
 
-async def updater(edit, state):
+async def updater(job, state):
     last = ""
-    while not state.get("stop"):
+    while not state.get("stop") and not job.cancelled:
         t = state.get("text", "")
         if t and t != last:
             try:
-                await edit(t); last = t
+                await job.edit(t, keep_markup=True); last = t
             except Exception:
                 pass
         await asyncio.sleep(3)
@@ -157,25 +233,54 @@ ptb_bot = None
 limit_hit = False
 pending = []   # jobs waiting for resume after YouTube upload limit
 
+def job_markup(jid):
+    active_count = sum(1 for j in jobs_by_id.values() if not j.cancelled and not j.finished)
+    btns = [InlineKeyboardButton("\u274c Cancel", callback_data=f"cancel:{jid}")]
+    if active_count > 1:
+        btns.append(InlineKeyboardButton("\U0001f5d1 Cancel All", callback_data="cancelall"))
+    return InlineKeyboardMarkup([btns])
+
+def resume_markup():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("\u25b6\ufe0f Resume", callback_data="resume"),
+        InlineKeyboardButton("\U0001f5d1 Cancel All", callback_data="cancelall")
+    ]])
+
+def dup_markup(fid):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("\U0001f504 Upload Anyway", callback_data=f"force:{fid}"),
+        InlineKeyboardButton("\u274c Cancel", callback_data=f"dismiss:{fid}")
+    ]])
+
 class Job:
-    def __init__(self, chat_id, msg_id, title, label, dl, custom_title=True):
+    def __init__(self, jid, chat_id, msg_id, title, label, dl, custom_title=True, src_key="", force=False):
+        self.id = jid
         self.chat_id, self.msg_id, self.title, self.label, self.dl = chat_id, msg_id, title, label, dl
         self.custom_title = custom_title
+        self.src_key = src_key
+        self.force = force
+        self.cancelled = False
+        self.finished = False
 
-    async def edit(self, text):
-        await ptb_bot.edit_message_text(text, chat_id=self.chat_id, message_id=self.msg_id)
+    async def edit(self, text, keep_markup=False):
+        rm = job_markup(self.id) if (keep_markup and not self.cancelled and not self.finished) else None
+        await ptb_bot.edit_message_text(text, chat_id=self.chat_id, message_id=self.msg_id, reply_markup=rm)
 
 def is_limit_error(e):
     return "uploadLimitExceeded" in str(e) or "exceeded the number of videos" in str(e)
 
 async def run_job(job):
-    """returns 'ok' | 'limit' | 'error'"""
+    """returns 'ok' | 'limit' | 'error' | 'cancelled'"""
+    if job.cancelled:
+        return "cancelled"
     prefix = (job.label + "\n") if job.label else ""
     state = {"prefix": prefix, "text": prefix + "\u23f3 Starting..."}
     d = tempfile.mkdtemp()
-    task = asyncio.create_task(updater(job.edit, state))
+    task = asyncio.create_task(updater(job, state))
     try:
-        res_dl = await job.dl(d, state)
+        res_dl = await job.dl(d, state, job)
+        if job.cancelled:
+            raise CancelledJob("Cancelled")
         out, det_title = res_dl if isinstance(res_dl, tuple) else (res_dl, None)
         if det_title and not job.custom_title:
             job.title = det_title
@@ -183,69 +288,188 @@ async def run_job(job):
                 job.label = f"{job.label.split(' ', 1)[0]} {det_title[:50]}"
                 prefix = job.label + "\n"
                 state["prefix"] = prefix
+            if not job.force:
+                dup = find_duplicate_uploaded(job.src_key, job.title, custom_title=True)
+                if dup:
+                    state["stop"] = True; await task
+                    job.finished = True
+                    fid = next(job_seq)
+                    forced_jobs[fid] = {
+                        "chat_id": job.chat_id, "title": job.title, "label": job.label,
+                        "dl": job.dl, "custom_title": True, "src_key": job.src_key
+                    }
+                    await ptb_bot.edit_message_text(
+                        prefix + f"\u26a0\ufe0f Duplicate video (already uploaded):\n{dup['title']}\nhttps://youtu.be/{dup['vid']}",
+                        chat_id=job.chat_id, message_id=job.msg_id, reply_markup=dup_markup(fid)
+                    )
+                    return "ok"
         state["text"] = prefix + f"\u2705 Downloaded ({fmt(os.path.getsize(out))}). Starting upload..."
-        vid = await asyncio.to_thread(upload, out, job.title, state)
+        vid = await asyncio.to_thread(upload, out, job.title, state, job)
         state["stop"] = True; await task
-        await job.edit(prefix + f"\u2705 Done (unlisted)\nhttps://youtu.be/{vid}")
+        job.finished = True
+        record_uploaded(job.src_key, job.title, vid)
+        await job.edit(prefix + f"\u2705 Done (unlisted)\nhttps://youtu.be/{vid}", keep_markup=False)
         return "ok"
+    except CancelledJob:
+        state["stop"] = True; await task
+        job.finished = True
+        try: await job.edit(prefix + "\U0001f6ab Cancelled by user.", keep_markup=False)
+        except Exception: pass
+        return "cancelled"
     except Exception as e:
         state["stop"] = True; await task
+        if job.cancelled or isinstance(e, CancelledJob) or "Cancelled" in str(e):
+            job.finished = True
+            try: await job.edit(prefix + "\U0001f6ab Cancelled by user.", keep_markup=False)
+            except Exception: pass
+            return "cancelled"
         if is_limit_error(e):
-            await job.edit(prefix + "\u23f8 Paused: YouTube upload limit reached. Waiting for resume.")
+            await job.edit(prefix + "\u23f8 Paused: YouTube upload limit reached. Waiting for resume.", keep_markup=True)
             return "limit"
-        await job.edit(prefix + f"\u274c Error: {e}"[:4000])
+        job.finished = True
+        await job.edit(prefix + f"\u274c Error: {e}"[:4000], keep_markup=False)
         return "error"
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
-def resume_markup():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("\u25b6\ufe0f Resume", callback_data="resume")]])
-
 async def execute(job):
     global limit_hit
-    async with lock:
-        if limit_hit:
-            pending.append(job)
-            try:
-                await job.edit((job.label + "\n" if job.label else "") + "\u23f8 Waiting for resume (YouTube limit).")
-            except Exception:
-                pass
+    try:
+        if job.cancelled:
             return
-        res = await run_job(job)
-        if res == "limit":
-            limit_hit = True
-            pending.append(job)
-            await ptb_bot.send_message(job.chat_id,
-                "\u26a0\ufe0f YouTube upload limit reached.\nWait until the limit resets (usually up to 24 hours), then press Resume. "
-                "Paused videos will download and upload again from where it stopped.",
-                reply_markup=resume_markup())
+        async with lock:
+            if job.cancelled:
+                return
+            if limit_hit:
+                pending.append(job)
+                try:
+                    await job.edit((job.label + "\n" if job.label else "") + "\u23f8 Waiting for resume (YouTube limit).", keep_markup=True)
+                except Exception:
+                    pass
+                return
+            res = await run_job(job)
+            if res == "limit":
+                limit_hit = True
+                pending.append(job)
+                await ptb_bot.send_message(job.chat_id,
+                    "\u26a0\ufe0f YouTube upload limit reached.\nWait until the limit resets (usually up to 24 hours), then press Resume. "
+                    "Paused videos will download and upload again from where it stopped.",
+                    reply_markup=resume_markup())
+    finally:
+        if job.finished or job.cancelled:
+            jobs_by_id.pop(job.id, None)
 
-async def on_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def on_callback(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global limit_hit
     q = u.callback_query
     if not allowed(q.from_user.id):
         return await q.answer("Not allowed.", show_alert=True)
-    if not limit_hit and not pending:
-        await q.answer("Nothing to resume.")
+    data = q.data or ""
+
+    if data == "resume":
+        if not limit_hit and not pending:
+            return await q.answer("Nothing to resume.")
+        limit_hit = False
+        jobs = [j for j in pending if not j.cancelled]
+        pending.clear()
+        await q.answer("Resuming...")
+        try: await q.edit_message_text(f"\u25b6\ufe0f Resumed {len(jobs)} video(s).")
+        except Exception: pass
+        for j in jobs:
+            asyncio.create_task(execute(j))
         return
-    limit_hit = False
-    jobs = pending[:]; pending.clear()
-    await q.answer("Resuming...")
-    try:
-        await q.edit_message_text(f"\u25b6\ufe0f Resumed {len(jobs)} video(s).")
-    except Exception:
-        pass
-    for j in jobs:
-        asyncio.create_task(execute(j))
+
+    if data.startswith("cancel:"):
+        jid = int(data.split(":", 1)[1])
+        job = jobs_by_id.get(jid)
+        if not job or job.finished or job.cancelled:
+            await q.answer("Already finished or cancelled.")
+            try: await q.edit_message_reply_markup(reply_markup=None)
+            except Exception: pass
+            return
+        job.cancelled = True
+        job.finished = True
+        if job in pending:
+            pending.remove(job)
+        jobs_by_id.pop(jid, None)
+        await q.answer("Cancelled.")
+        prefix = (job.label + "\n") if job.label else ""
+        try: await q.edit_message_text(prefix + "\U0001f6ab Cancelled by user.")
+        except Exception: pass
+        return
+
+    if data == "cancelall":
+        count = 0
+        for jid, job in list(jobs_by_id.items()):
+            if not job.finished and not job.cancelled:
+                job.cancelled = True
+                job.finished = True
+                count += 1
+                prefix = (job.label + "\n") if job.label else ""
+                try: await job.edit(prefix + "\U0001f6ab Cancelled by user.", keep_markup=False)
+                except Exception: pass
+        pending.clear()
+        jobs_by_id.clear()
+        limit_hit = False
+        await q.answer(f"Cancelled {count} video(s).")
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        return
+
+    if data.startswith("force:"):
+        fid = int(data.split(":", 1)[1])
+        spec = forced_jobs.pop(fid, None)
+        if not spec:
+            return await q.answer("Expired. Send the link again.")
+        await q.answer("Starting upload...")
+        try: await q.edit_message_text((spec["label"] + "\n" if spec["label"] else "") + "\U0001f504 Force uploading duplicate...")
+        except Exception: pass
+        await new_job(spec["chat_id"], spec["title"], spec["label"], spec["dl"],
+                      custom_title=spec["custom_title"], src_key=spec["src_key"], force=True)
+        return
+
+    if data.startswith("dismiss:"):
+        fid = int(data.split(":", 1)[1])
+        forced_jobs.pop(fid, None)
+        await q.answer("Skipped.")
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        return
 
 def allowed(uid):
     return not ALLOWED or uid in ALLOWED
 
-async def new_job(chat_id, title, label, dl, custom_title=True):
+async def new_job(chat_id, title, label, dl, custom_title=True, src_key="", force=False):
     pre = (label + "\n") if label else ""
+    if not force:
+        act = find_duplicate_active(src_key, title, custom_title=custom_title)
+        if act:
+            await ptb_bot.send_message(chat_id, pre + f"\u26a0\ufe0f Duplicate skipped (already in queue / running):\n{act.title}")
+            return
+        dup = find_duplicate_uploaded(src_key, title, custom_title=custom_title)
+        if dup:
+            fid = next(job_seq)
+            forced_jobs[fid] = {
+                "chat_id": chat_id, "title": title, "label": label,
+                "dl": dl, "custom_title": custom_title, "src_key": src_key
+            }
+            await ptb_bot.send_message(
+                chat_id,
+                pre + f"\u26a0\ufe0f Duplicate video (already uploaded):\n{dup['title']}\nhttps://youtu.be/{dup['vid']}",
+                reply_markup=dup_markup(fid)
+            )
+            return
+    jid = next(job_seq)
     wait = lock.locked() or limit_hit
-    m = await ptb_bot.send_message(chat_id, pre + ("\u23f3 In queue..." if wait else "\u23f3 Starting..."))
-    asyncio.create_task(execute(Job(chat_id, m.message_id, title, label, dl, custom_title=custom_title)))
+    job = Job(jid, chat_id, 0, title, label, dl, custom_title=custom_title, src_key=src_key, force=force)
+    jobs_by_id[jid] = job
+    m = await ptb_bot.send_message(
+        chat_id,
+        pre + ("\u23f3 In queue..." if wait else "\u23f3 Starting..."),
+        reply_markup=job_markup(jid)
+    )
+    job.msg_id = m.message_id
+    asyncio.create_task(execute(job))
 
 def guess_title(url):
     ym = YT_ID_RE.search(url)
@@ -257,7 +481,7 @@ def guess_title(url):
 
 async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("Send one or more YouTube/m3u8/video links (one per line, optional title after the link), "
-                               "or forward/send any video. I will download it in best quality and upload to YouTube as unlisted.")
+                               "or forward/send any video. I will check for duplicates, download in best quality, and upload to YouTube as unlisted.")
 
 async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not allowed(u.effective_user.id):
@@ -270,20 +494,29 @@ async def handle_text(u: Update, c: ContextTypes.DEFAULT_TYPE):
             fp.write(text.replace("\r\n", "\n") + "\n")
         return await u.message.reply_text("\u2705 YouTube cookies updated.")
     items = []
+    seen_in_msg = set()
+    dup_in_msg = 0
     for line in text.splitlines():
         m = URL_RE.search(line)
         if m:
             raw_url = m.group(0)
             url = raw_url if raw_url.lower().startswith(("http://", "https://")) else "https://" + raw_url
-            items.append((url, line.replace(raw_url, "").strip()))
+            sk = norm_url_key(url)
+            if sk in seen_in_msg:
+                dup_in_msg += 1
+                continue
+            seen_in_msg.add(sk)
+            items.append((url, line.replace(raw_url, "").strip(), sk))
+    if dup_in_msg:
+        await u.message.reply_text(f"\u26a0\ufe0f Skipped {dup_in_msg} duplicate link(s) inside your message.")
     n = len(items)
-    for i, (url, t) in enumerate(items, 1):
+    for i, (url, t, sk) in enumerate(items, 1):
         has_custom = bool(t)
         title = t or guess_title(url)
         label = f"[{i}/{n}] {title[:50]}" if n > 1 else ""
-        async def dl(d, state, url=url):
-            return await asyncio.to_thread(download_url_sync, url, d, state)
-        await new_job(u.effective_chat.id, title, label, dl, custom_title=has_custom)
+        async def dl(d, state, job, url=url):
+            return await asyncio.to_thread(download_url_sync, url, d, state, job)
+        await new_job(u.effective_chat.id, title, label, dl, custom_title=has_custom, src_key=sk)
 
 async def handle_media(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if USE_TELETHON:
@@ -292,15 +525,19 @@ async def handle_media(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await u.message.reply_text("Not allowed.")
     m = u.message
     att = m.video or m.document or m.animation
-    title = (m.caption or getattr(att, "file_name", None) or "Telegram video").rsplit(".", 1)[0]
+    fname = getattr(att, "file_name", None) or ""
+    title = (m.caption or fname or "Telegram video").rsplit(".", 1)[0]
+    sk = "tg:" + (getattr(att, "file_unique_id", "") or str(getattr(att, "file_id", "")))
     if att.file_size and att.file_size > 20 * 1024 * 1024:
         return await m.reply_text("File is bigger than 20 MB. Set TG_API_ID and TG_API_HASH to enable big files.")
-    async def dl(d, state):
+    async def dl(d, state, job):
+        if job.cancelled:
+            raise CancelledJob("Cancelled")
         f = await att.get_file()
         p = os.path.join(d, "video.mp4")
         await f.download_to_drive(p)
         return p
-    await new_job(u.effective_chat.id, title, "", dl)
+    await new_job(u.effective_chat.id, title, "", dl, custom_title=bool(m.caption or fname), src_key=sk)
 
 async def setup_telethon():
     global tl_client
@@ -321,24 +558,28 @@ async def setup_telethon():
             return
         name = fname.rsplit(".", 1)[0] if fname else ""
         title = e.raw_text or name or "Telegram video"
-        async def dl(d, state):
+        sk = f"tg:{e.document.id}" if e.document else ""
+        async def dl(d, state, job):
             p = os.path.join(d, "video.mp4")
             def cb(cur, tot):
+                if job.cancelled:
+                    raise CancelledJob("Cancelled")
                 state["text"] = (state["prefix"] + f"\u2b07\ufe0f Downloading from Telegram\n{bar(cur*100/tot if tot else 0)}\n"
                                  f"{fmt(cur)} / {fmt(tot)}")
             await tl_client.download_media(e.message, file=p, progress_callback=cb)
             return p
-        await new_job(e.chat_id, title, "", dl)
+        await new_job(e.chat_id, title, "", dl, custom_title=bool(e.raw_text or name), src_key=sk)
 
 async def health(_): return web.Response(text="ok")
 
 async def main():
     global ptb_bot
     init_cookies()
+    load_history()
     app = Application.builder().token(os.environ["BOT_TOKEN"]).build()
     ptb_bot = app.bot
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(on_resume, pattern="^resume$"))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO | filters.ANIMATION, handle_media))
     web_app = web.Application(); web_app.router.add_get("/", health)
